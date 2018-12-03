@@ -30,7 +30,6 @@ run:
 	docker run -it -p $(APP_PORT):$(APP_PORT) $(SERVICE_NAME):latest
 test:
 	# Replace with some test
-
 	docker build -t $(SERVICE_NAME) .
 ecr-create:
 	aws ecr create-repository --repository-name $(IMAGE_NAME) --profile $(AWS_PROFILE) --region $(AWS_REGION)
