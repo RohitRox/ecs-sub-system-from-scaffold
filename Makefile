@@ -36,3 +36,6 @@ test:
 
 create-pr-code-build:
 	aws cloudformation create-stack --stack-name $(STACK_NAME)-pr-code-build --template-body file://Infrastructure/pr.yaml --profile $(AWS_PROFILE) --region $(AWS_REGION) --capabilities CAPABILITY_NAMED_IAM --parameters ParameterKey=SubSystem,ParameterValue=$(SUB_SYSTEM) ParameterKey=GitUser,ParameterValue=$(GIT_USER) ParameterKey=GitRepo,ParameterValue=$(GIT_REPO)
+
+test-changes:
+	echo "GO"
