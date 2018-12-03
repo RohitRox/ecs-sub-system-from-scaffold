@@ -1,0 +1,55 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Workers dynamo table
+
+Parameters:
+  EnvironmentName:
+    Description: Name of the environment this cloudformation stack belongs to
+    Type: String
+  EnvironmentType:
+    Default: nonproduction
+    Description: Type of the environment for this stack
+    Type: String
+    AllowedValues:
+      - nonproduction
+      - production
+  SubSystem:
+    Type: String
+    Description: Subsystem Code
+  ReadCapacityUnits:
+    Description: Provisioned read throughput
+    Type: Number
+    Default: '5'
+    MinValue: '5'
+    MaxValue: '10000'
+    ConstraintDescription: must be between 5 and 10000
+  WriteCapacityUnits:
+    Description: Provisioned write throughput
+    Type: Number
+    Default: '10'
+    MinValue: '5'
+    MaxValue: '10000'
+    ConstraintDescription: must be between 5 and 10000
+
+Resources:
+  WorkersDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+      - AttributeName: Id
+        AttributeType: S
+      KeySchema:
+      - AttributeName: Id
+        KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits:
+          Ref: ReadCapacityUnits
+        WriteCapacityUnits:
+          Ref: WriteCapacityUnits
+      TableName: !Sub ${EnvironmentName}-${SubSystem}-workers
+Outputs:
+  TableName:
+    Value: !Ref WorkersDynamoDBTable
+    Description: Dynamo table name
+    Export:
+      Name: !Join [ ':', [ !Ref EnvironmentName, WorkersDynamoDBTable ] ]

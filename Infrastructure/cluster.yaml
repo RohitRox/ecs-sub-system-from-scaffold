@@ -1,0 +1,240 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'This is a template to create ECS cluster with the assumption
+that VPC details would be provided to it. ECS cluster is going
+to create services and consequently tasks in private subnets. The load
+balancer is also created which routes traffic based on path
+to proper services.'
+
+Parameters:
+  EnvironmentName:
+    Description: Name of the environment this cloudformation stack belongs to
+    Type: String
+
+  EnvironmentType:
+    Default: nonproduction
+    Description: Type of the environment for this stack
+    Type: String
+    AllowedValues:
+      - nonproduction
+      - production
+
+  SubSystem:
+    Type: String
+    Description: Subsystem Code
+
+  #NOTE: we will eventually have SSL for our endpoints
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: ARN of the Amazon Certificate for the loadbalancer secure port
+
+  LoadBalancerScheme:
+    Description: 'LoadBalancer for ECS can be internal reachable to our subnet CIDR or public reachable from the world'
+    Type: String
+    Default: internal
+    AllowedValues:
+    - internet-facing
+    - internal
+
+  DomainName:
+    Type: String
+    Description: Local domain name into which services are prepended, for example example.wis.sputnik.local
+
+Conditions:
+  LoadBalancerSchemeIsInternal: !Equals [!Ref LoadBalancerScheme, 'internal']
+  LoadBalancerHasCertificateArn: !Not [!Equals [!Ref CertificateArn, '']]
+
+Resources:
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Join [ '-', [ !Ref EnvironmentName, !Ref SubSystem ] ]
+
+  # ServiceDiscoveryNamespace:
+  #   Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+  #   Properties:
+  #     Description: !Sub Service Discovery Namespace for ${AWS::StackName}
+  #     Vpc:
+  #       Fn::ImportValue: !Join [':', [!Ref 'EnvironmentName', 'VPC']]
+  #     Name: !Ref DomainName
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the public facing load-balancer
+      VpcId:
+        Fn::ImportValue: !Join [':', [!Ref 'EnvironmentName', 'VPC']]
+      # FIXME: Only open the required ports
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: "-1"
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: !Ref LoadBalancerScheme
+      Subnets: !If
+      - LoadBalancerSchemeIsInternal
+      - - Fn::ImportValue: !Join [ ':', [ !Ref EnvironmentName, 'SubnetAZ1Private' ]]
+        - Fn::ImportValue: !Join [ ':', [ !Ref EnvironmentName, 'SubnetAZ2Private' ]]
+      - - Fn::ImportValue: !Join [ ':', [ !Ref EnvironmentName, 'SubnetAZ1Public' ]]
+        - Fn::ImportValue: !Join [ ':', [ !Ref EnvironmentName, 'SubnetAZ2Public' ]]
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      LoadBalancerAttributes:
+        - Key: access_logs.s3.enabled
+          Value: 'true'
+        - Key: access_logs.s3.bucket
+          Value: !ImportValue BucketLoadBalancer
+        - Key: idle_timeout.timeout_seconds
+          Value: 30
+
+  DefaultTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 6
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Name: !Ref ECSCluster
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId:
+        Fn::ImportValue: !Join [':', [!Ref 'EnvironmentName', 'VPC']]
+
+  LoadBalancerListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref 'DefaultTargetGroup'
+          Type: 'forward'
+      LoadBalancerArn: !Ref 'LoadBalancer'
+      Port: 80
+      Protocol: HTTP
+
+  LoadBalancerListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: LoadBalancerHasCertificateArn
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref 'DefaultTargetGroup'
+          Type: 'forward'
+      LoadBalancerArn: !Ref 'LoadBalancer'
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref 'CertificateArn'
+
+  # This is a role which is used by the ECS tasks themselves.
+  # We are deeming this role as the common denominator of permission among tasks(containers)
+  # Task/Service specific permission would go under ServiceRole
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs-tasks.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: AmazonECSTaskExecutionRolePolicy
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                # Allow the ECS Tasks to download images from ECR
+                - 'ecr:GetAuthorizationToken'
+                - 'ecr:BatchCheckLayerAvailability'
+                - 'ecr:GetDownloadUrlForLayer'
+                - 'ecr:BatchGetImage'
+
+                # Allow the ECS tasks to upload logs to CloudWatch
+                - 'logs:CreateLogStream'
+                - 'logs:PutLogEvents'
+              Resource: '*'
+
+  # A role used by AWS Autoscaling to get the stats for the Fargate
+  # service, and update it to increase or decrease the number of containers
+  AutoscalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [application-autoscaling.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: service-autoscaling
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+              - 'application-autoscaling:*'
+              - 'cloudwatch:DescribeAlarms'
+              - 'cloudwatch:PutMetricAlarm'
+              - 'ecs:DescribeServices'
+              - 'ecs:UpdateService'
+            Resource: '*'
+
+Outputs:
+  ClusterName:
+    Description: The name of the ECS cluster
+    Value: !Ref 'ECSCluster'
+    Export:
+      Name: !Join [ ':', [ !Ref EnvironmentName, !Ref SubSystem, 'ClusterName' ] ]
+
+  ClusterUrl:
+    Description: The url of the external load balancer
+    Value: !Join ['', ['http://', !GetAtt 'LoadBalancer.DNSName']]
+    Export:
+      Name: !Join [ ':', [ !Ref EnvironmentName, !Ref SubSystem, 'ClusterUrl' ] ]
+
+  ECSTaskExecutionRole:
+    Description: The ARN of the ECS role
+    Value: !GetAtt 'ECSTaskExecutionRole.Arn'
+    Export:
+      Name: !Join [ ':', [ !Ref EnvironmentName, !Ref SubSystem, 'ECSTaskExecutionRole' ] ]
+
+  AutoscalingRole:
+    Description: The ARN of the ECS role
+    Value: !GetAtt 'AutoscalingRole.Arn'
+    Export:
+      Name: !Join [ ':', [ !Ref EnvironmentName, !Ref SubSystem, 'AutoscalingRole' ] ]
+
+  HTTPListener:
+    Description: The ARN of the load balancer's HTTP Listener
+    Value: !Ref LoadBalancerListenerHTTP
+    Export:
+      Name: !Join [ ':', [ !Ref EnvironmentName, !Ref SubSystem, 'ListenerHTTP' ] ]
+
+  HTTPSListener:
+    Description: The ARN of the load balancer's HTTPS Listener
+    Condition: LoadBalancerHasCertificateArn
+    Value: !Ref LoadBalancerListenerHTTPS
+    Export:
+      Name: !Join [ ':', [ !Ref 'EnvironmentName', !Ref SubSystem, 'ListenerHTTPS' ] ]
+
+  LoadBalancerSecurityGroup:
+    Description: The load balancer security group
+    Value: !Ref LoadBalancerSecurityGroup
+    Export:
+      Name: !Join [ ':', [ !Ref 'EnvironmentName', !Ref SubSystem, 'LoadBalancerSecurityGroup' ] ]
+
+  # ServiceDiscoveryNamespace:
+  #   Description: The ID of the private service discovery domain
+  #   Value: !Ref ServiceDiscoveryNamespace
+  #   Export:
+  #     Name: !Join [ ':', [ !Ref 'EnvironmentName', !Ref SubSystem, 'ServiceDiscoveryNamespace' ] ]
+
+  # ServiceDiscoveryEndpoint:
+  #   Description: Service discovery endpoint
+  #   Value: !Ref DomainName
+  #   Export:
+  #     Name: !Join [ ':', [ !Ref 'EnvironmentName', !Ref SubSystem, 'ServiceDiscoveryEndpoint' ] ]
